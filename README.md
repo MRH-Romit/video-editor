@@ -169,9 +169,7 @@ If you encounter any issues or have questions:
 2. Create a new issue if your problem isn't already reported
 3. Provide detailed information about your system and the issue
 
-## Authors
 
-- **Your Name** - *Initial work* - [YourGitHub](https://github.com/yourusername)
 
 ---
 
