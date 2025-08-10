@@ -1,219 +1,10 @@
-
+# main.py
 import os
 import sys
-import time
-import threading
-from dataclasses import dataclass
-from typing import Optional, Tuple
-
-import cv2
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
-
-def cvimg_to_qimage(img_bgr: np.ndarray) -> QtGui.QImage:
-    if img_bgr is None:
-        return QtGui.QImage()
-    if len(img_bgr.shape) == 2:
-        h, w = img_bgr.shape
-        bytes_per_line = w
-        qimg = QtGui.QImage(img_bgr.data, w, h, bytes_per_line, QtGui.QImage.Format_Grayscale8)
-        return qimg.copy()
-    h, w, ch = img_bgr.shape
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    bytes_per_line = ch * w
-    qimg = QtGui.QImage(img_rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
-    return qimg.copy()
-
-
-def fit_to_label(image: QtGui.QImage, label: QtWidgets.QLabel) -> QtGui.QPixmap:
-    if image.isNull():
-        return QtGui.QPixmap()
-    target = label.size() * label.devicePixelRatioF()
-    pm = QtGui.QPixmap.fromImage(image)
-    return pm.scaled(int(target.width()), int(target.height()), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
-
-
-@dataclass
-class EffectParams:
-    name: str = "None"
-    intensity: float = 0.5
-    strength: int = 3
-    hue: int = 0
-    saturation: float = 1.0
-    value: float = 1.0
-    pixel_size: int = 8
-    sharpen: float = 1.0
-
-
-class Effects:
-    @staticmethod
-    def apply(frame: np.ndarray, p: EffectParams) -> np.ndarray:
-        if frame is None:
-            return frame
-        name = p.name
-        if name == "None":
-            return frame
-        if name == "Grayscale":
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        if name == "Canny Edge":
-            low = int(50 + 200 * (1 - p.intensity))
-            high = int(150 + 400 * p.intensity)
-            edges = cv2.Canny(frame, low, high)
-            return cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-        if name == "Gaussian Blur":
-            k = max(1, p.strength)
-            if k % 2 == 0:
-                k += 1
-            return cv2.GaussianBlur(frame, (k, k), 0)
-        if name == "Sharpen":
-            amt = max(0.0, min(3.0, p.sharpen))
-            blur = cv2.GaussianBlur(frame, (0, 0), 2.0)
-            out = cv2.addWeighted(frame, 1 + amt, blur, -amt, 0)
-            return out
-        if name == "Sepia":
-            kernel = np.array([[0.272, 0.534, 0.131],
-                               [0.349, 0.686, 0.168],
-                               [0.393, 0.769, 0.189]], dtype=np.float32)
-            sep = cv2.transform(frame, kernel)
-            return np.clip(sep, 0, 255).astype(np.uint8)
-        if name == "Cartoon":
-            color = cv2.bilateralFilter(frame, d=9, sigmaColor=75, sigmaSpace=75)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            edges = cv2.medianBlur(gray, 7)
-            edges = cv2.adaptiveThreshold(edges, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                          cv2.THRESH_BINARY, 9, 2)
-            edges = cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
-            return cv2.bitwise_and(color, edges)
-        if name == "Pixelate":
-            step = max(2, p.pixel_size)
-            h, w = frame.shape[:2]
-            small = cv2.resize(frame, (w // step, h // step), interpolation=cv2.INTER_LINEAR)
-            return cv2.resize(small, (w, h), interpolation=cv2.INTER_NEAREST)
-        if name == "HSV Adjust":
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV).astype(np.float32)
-            h, s, v = cv2.split(hsv)
-            h = (h + (p.hue / 2)) % 180
-            s = np.clip(s * p.saturation, 0, 255)
-            v = np.clip(v * p.value, 0, 255)
-            hsv = cv2.merge([h, s, v]).astype(np.uint8)
-            return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-        if name == "Glitch":
-            h, w = frame.shape[:2]
-            shift = int(max(1, w * 0.01 + p.intensity * w * 0.02))
-            ch = list(cv2.split(frame))
-            ch[2] = np.roll(ch[2], shift, axis=1)
-            ch[0] = np.roll(ch[0], -shift // 2, axis=0)
-            out = cv2.merge(ch)
-            for r in range(0, h, 4):
-                out[r:r+1, :, :] = out[r:r+1, :, :] * (0.8 + 0.2 * np.random.rand())
-            return out
-        if name == "Motion Blur":
-            k = max(3, p.strength)
-            if k % 2 == 0:
-                k += 1
-            kernel = np.zeros((k, k), dtype=np.float32)
-            kernel[k//2, :] = 1.0 / k
-            return cv2.filter2D(frame, -1, kernel)
-        return frame
-
-
-class VideoReader(QtCore.QThread):
-    frame_signal = QtCore.Signal(np.ndarray, float)
-
-    def __init__(self):
-        super().__init__()
-        self.cap: Optional[cv2.VideoCapture] = None
-        self.running = False
-        self.paused = False
-        self.filepath: Optional[str] = None
-        self._lock = threading.Lock()
-
-    def open(self, path: str) -> Tuple[bool, str]:
-        with self._lock:
-            if self.cap is not None:
-                self.cap.release()
-                self.cap = None
-        self.filepath = path
-        self.cap = cv2.VideoCapture(path)
-        if not self.cap.isOpened():
-            return False, "Failed to open video."
-        self.running = True
-        self.paused = False
-        if not self.isRunning():
-            self.start()
-        return True, "OK"
-
-    def run(self):
-        while True:
-            if not self.running or self.cap is None:
-                time.sleep(0.03)
-                continue
-            if self.paused:
-                time.sleep(0.02)
-                continue
-            ok, frame = self.cap.read()
-            if not ok:
-                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                continue
-            fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
-            self.frame_signal.emit(frame, fps)
-            delay = 1.0 / max(1.0, fps)
-            time.sleep(min(0.05, delay))
-
-    def stop(self):
-        self.running = False
-        self.paused = True
-        with self._lock:
-            if self.cap is not None:
-                self.cap.release()
-                self.cap = None
-
-
-class ExportWorker(QtCore.QThread):
-    progress = QtCore.Signal(int)
-    finished_ok = QtCore.Signal(str)
-    failed = QtCore.Signal(str)
-
-    def __init__(self, path_in: str, path_out: str, params: EffectParams):
-        super().__init__()
-        self.path_in = path_in
-        self.path_out = path_out
-        self.params = params
-
-    def run(self):
-        cap = cv2.VideoCapture(self.path_in)
-        if not cap.isOpened():
-            self.failed.emit("Could not open input video")
-            return
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(self.path_out, fourcc, fps, (w, h))
-        if not out.isOpened():
-            self.failed.emit("Could not open output file for writing")
-            cap.release()
-            return
-        i = 0
-        try:
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                processed = Effects.apply(frame, self.params)
-                out.write(processed)
-                i += 1
-                if total > 0:
-                    self.progress.emit(int(100 * i / total))
-        except Exception as e:
-            self.failed.emit(str(e))
-        finally:
-            cap.release()
-            out.release()
-        self.finished_ok.emit(self.path_out)
-
+from effects import cvimg_to_qimage, fit_to_label, Effects, EffectParams
+from video_io import VideoReader, ExportWorker
 
 class VideoFXStudio(QtWidgets.QMainWindow):
     def __init__(self):
@@ -228,9 +19,9 @@ class VideoFXStudio(QtWidgets.QMainWindow):
 
         self.params = EffectParams()
         self.current_fps = 30.0
-        self.current_frame: Optional[np.ndarray] = None
-        self.current_processed: Optional[np.ndarray] = None
-        self.loaded_path: Optional[str] = None
+        self.current_frame: np.ndarray | None = None
+        self.current_processed: np.ndarray | None = None
+        self.loaded_path: str | None = None
 
         self._build_ui()
 
@@ -300,7 +91,8 @@ class VideoFXStudio(QtWidgets.QMainWindow):
         self.progress.setVisible(False)
         main.addWidget(self.progress)
 
-    def _labeled_slider(self, name: str, minv: int, maxv: int, val: int, layout: QtWidgets.QGridLayout, row: int) -> QtWidgets.QSlider:
+    def _labeled_slider(self, name: str, minv: int, maxv: int, val: int,
+                        layout: QtWidgets.QGridLayout, row: int) -> QtWidgets.QSlider:
         label = QtWidgets.QLabel(name)
         slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         slider.setRange(minv, maxv)
@@ -329,17 +121,17 @@ class VideoFXStudio(QtWidgets.QMainWindow):
         grid = self.centralWidget().findChild(QtWidgets.QGroupBox, "Effects").layout()
         for i in range(grid.rowCount()):
             for j in range(3):
-                w = grid.itemAtPosition(i, j)
-                if not w:
+                item = grid.itemAtPosition(i, j)
+                if not item:
                     continue
-                item = w.widget()
-                if isinstance(item, QtWidgets.QLabel) and item.text() in show:
-                    visible = show[item.text()]
-                    item.setVisible(visible)
+                w = item.widget()
+                if isinstance(w, QtWidgets.QLabel) and w.text() in show:
+                    vis = show[w.text()]
+                    w.setVisible(vis)
                     sld_item = grid.itemAtPosition(i, 1)
                     val_item = grid.itemAtPosition(i, 2)
-                    if sld_item: sld_item.widget().setVisible(visible)
-                    if val_item: val_item.widget().setVisible(visible)
+                    if sld_item: sld_item.widget().setVisible(vis)
+                    if val_item: val_item.widget().setVisible(vis)
 
     def _sync_params(self):
         self.params.name = self.cmb_effect.currentText()
@@ -376,7 +168,8 @@ class VideoFXStudio(QtWidgets.QMainWindow):
         return ext in {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
     def open_file(self):
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Open Video", "", "Video Files (*.mp4 *.mov *.avi *.mkv *.webm)")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open Video", "", "Video Files (*.mp4 *.mov *.avi *.mkv *.webm)")
         if path:
             self.load_video(path)
 
@@ -387,6 +180,7 @@ class VideoFXStudio(QtWidgets.QMainWindow):
             return
         self.loaded_path = path
         self.lbl_status.setText(f"Loaded: {os.path.basename(path)}")
+        self.btn_play.setText("Pause")
 
     def toggle_play(self):
         if not self.reader.cap:
@@ -409,7 +203,9 @@ class VideoFXStudio(QtWidgets.QMainWindow):
         if not self.loaded_path:
             QtWidgets.QMessageBox.information(self, "No video", "Load a video first.")
             return
-        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Processed Video", self._suggest_out_path(self.loaded_path), "MP4 Video (*.mp4)")
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Save Processed Video", self._suggest_out_path(self.loaded_path),
+            "MP4 Video (*.mp4)")
         if not out_path:
             return
         export_params = EffectParams(**self.params.__dict__)
@@ -449,13 +245,11 @@ class VideoFXStudio(QtWidgets.QMainWindow):
         QProgressBar::chunk { border-radius: 10px; }
         """
 
-
 def main():
     app = QtWidgets.QApplication(sys.argv)
     w = VideoFXStudio()
     w.show()
     sys.exit(app.exec())
-
 
 if __name__ == "__main__":
     main()
